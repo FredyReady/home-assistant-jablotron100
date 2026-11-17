@@ -23,6 +23,7 @@ def authorisation(monkeypatch):
 	jablotron._authorisation_lock = threading.Lock()
 	jablotron._login_failed = threading.Event()
 	jablotron._authorisation_restore_pending = False
+	jablotron._init_authorisation_session()
 	jablotron._stream_stop_event = Mock()
 	jablotron._stream_stop_event.is_set.return_value = False
 	jablotron._stream_stop_event.wait.return_value = False

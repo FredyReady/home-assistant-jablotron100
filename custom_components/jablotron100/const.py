@@ -191,6 +191,7 @@ COMMAND_ENABLE_DEVICE_STATE_PACKETS: Final[bytes] = b"\x13"
 COMMAND_RESPONSE_DEVICE_STATUS: Final[bytes] = b"\x8a"
 
 UI_CONTROL_AUTHORISATION_END: Final[bytes] = b"\x01"
+UI_CONTROL_AUTHORISATION_PING: Final[bytes] = b"\x02"
 UI_CONTROL_AUTHORISATION_CODE: Final[bytes] = b"\x03"
 UI_CONTROL_MODIFY_SECTION: Final[bytes] = b"\x0d"
 UI_CONTROL_TOGGLE_PG_OUTPUT: Final[bytes] = b"\x23"
@@ -203,6 +204,17 @@ EMPTY_PACKET: Final[bytes] = b"\x00"
 
 # In minutes
 TIMEOUT_FOR_DEVICE_STATE_PACKETS: Final = 5
+
+# In seconds. The central unit closes an authorised channel 15 s after the
+# login or the last authorisation ping, so the channel is kept open with a ping
+# every 5 s instead of sending the code again (every login is a new event in
+# the central unit's event log).
+AUTHORISATION_PING_INTERVAL: Final = 5
+AUTHORISATION_PING_REPLY_TIMEOUT: Final = 15
+# Never log in more often than this, also after a failed or lost login.
+AUTHORISATION_LOGIN_MIN_INTERVAL: Final = 45
+# Device state packets are enabled for TIMEOUT_FOR_DEVICE_STATE_PACKETS minutes.
+DEVICE_STATE_PACKETS_REFRESH_INTERVAL: Final = 45
 
 
 class SystemInfo(Enum):

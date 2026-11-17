@@ -30,6 +30,9 @@ import threading
 import time
 from .code import validate_authorisation_code
 from .const import (
+	AUTHORISATION_LOGIN_MIN_INTERVAL,
+	AUTHORISATION_PING_INTERVAL,
+	AUTHORISATION_PING_REPLY_TIMEOUT,
 	AUTODETECT_SERIAL_PORT,
 	BATTERY_LEVEL_NO_BATTERY,
 	BATTERY_LEVEL_NO_CHANGE_FROM_PREVIOUS_STATE,
@@ -77,6 +80,7 @@ from .const import (
 	DeviceType,
 	DEVICE_STATE_EVENT_MASK,
 	DEVICE_STATE_FLAGS_MASK,
+	DEVICE_STATE_PACKETS_REFRESH_INTERVAL,
 	EVENT_WRONG_CODE,
 	EMPTY_PACKET,
 	EntityType,
@@ -113,6 +117,7 @@ from .const import (
 	TIMEOUT_FOR_DEVICE_STATE_PACKETS,
 	UI_CONTROL_AUTHORISATION_CODE,
 	UI_CONTROL_AUTHORISATION_END,
+	UI_CONTROL_AUTHORISATION_PING,
 	UI_CONTROL_MODIFY_SECTION,
 	UI_CONTROL_TOGGLE_PG_OUTPUT,
 )
@@ -281,6 +286,17 @@ class Jablotron:
 		self._authorisation_lock = threading.Lock()
 		self._login_failed = threading.Event()
 		self._authorisation_restore_pending = False
+		self._init_authorisation_session()
+
+	def _init_authorisation_session(self) -> None:
+		# Is the authorised channel (opened by the configured code) believed to be open?
+		self._authorisation_open = threading.Event()
+		self._last_login_at: float | None = None
+		self._last_authorisation_ping_at: float = 0.0
+		self._last_authorisation_ping_reply_at: float = 0.0
+		# Older central units may not answer the ping; only rely on replies once one was seen.
+		self._authorisation_ping_replies_seen = False
+		self._last_device_state_packets_enabled_at: float = 0.0
 
 	def signal_entities_added(self) -> str:
 		return "{}_{}_entities_added".format(DOMAIN, self._config_entry_id)
@@ -452,10 +468,13 @@ class Jablotron:
 			self._login_failed.clear()
 			self._authorisation_restore_pending = True
 			try:
+				self._authorisation_open.clear()
 				self._send_packets([
 					self.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END),
 					self.create_packet_authorisation_code(code),
 				])
+				if code == configured_code:
+					self._authorisation_opened()
 				if self._stream_stop_event.wait(1.0):
 					return
 
@@ -474,6 +493,7 @@ class Jablotron:
 								*self.create_packets_keepalive(configured_code),
 							])
 							self._authorisation_restore_pending = False
+							self._authorisation_opened()
 					finally:
 						self._stream_stop_event.wait(1.0)
 
@@ -1180,6 +1200,8 @@ class Jablotron:
 		for device_number in devices_to_update:
 			if self._stream_stop_event.is_set():
 				return
+			# The check can take longer than the authorised channel lasts without a ping.
+			self._send_authorisation_ping_if_due()
 			self._stream_diagnostics_event.clear()
 
 			self._send_packets([
@@ -1218,6 +1240,8 @@ class Jablotron:
 		self._update_all_hass_entities()
 
 	def _set_unavailable(self) -> None:
+		# The connection was lost, so the authorised channel has to be opened again.
+		self._authorisation_open.clear()
 		self.last_update_success = False
 		self._update_all_hass_entities()
 
@@ -1302,8 +1326,16 @@ class Jablotron:
 
 						elif self._is_login_error_packet(packet):
 							self._login_failed.set()
+							self._authorisation_open.clear()
 							self._last_authorized_user_or_device = None
 							self._login_error()
+
+						elif self._is_authorisation_ping_packet(packet):
+							self._authorisation_ping_replied()
+
+						elif self._is_authorisation_end_packet(packet):
+							LOGGER.debug("Authorised channel closed by the central unit")
+							self._authorisation_open.clear()
 
 					break
 
@@ -1338,7 +1370,6 @@ class Jablotron:
 				pass
 
 	def _keepalive(self):
-		counter = 0
 		last_devices_update = None
 
 		while not self._stream_stop_event.is_set():
@@ -1346,9 +1377,15 @@ class Jablotron:
 				if self._stream_stop_event.is_set():
 					break
 				try:
-					if counter == 0 and not self._is_alarm_active():
-						if not self._send_keepalive():
-							continue
+					sent = False
+
+					if not self._is_alarm_active():
+						if self._is_login_needed():
+							if not self._send_keepalive():
+								continue
+							sent = True
+						else:
+							sent = self._send_authorisation_ping_if_due()
 
 						# Check some devices once an hour (and on the start too)
 						actual_time = datetime.datetime.now()
@@ -1360,20 +1397,82 @@ class Jablotron:
 							self._force_devices_info_update()
 
 							last_devices_update = actual_time
-					else:
+
+					if not sent:
 						self._send_packet(self.create_packet_command(COMMAND_HEARTBEAT))
 
 				except Exception as ex:
 					LOGGER.exception("Write error: %s", ex)
 					self._set_unavailable()
 					self._redetect_serial_port()
-
-				counter += 1
 			else:
 				self._stream_stop_event.wait(1)
 
-			if counter == 60:
-				counter = 0
+	def _is_login_needed(self) -> bool:
+		now = time.monotonic()
+
+		if self._last_login_at is not None and now - self._last_login_at < AUTHORISATION_LOGIN_MIN_INTERVAL:
+			return False
+
+		if self._authorisation_restore_pending or not self._authorisation_open.is_set():
+			return True
+
+		if (
+			self._authorisation_ping_replies_seen
+			and now - self._last_authorisation_ping_reply_at > AUTHORISATION_PING_REPLY_TIMEOUT
+		):
+			LOGGER.debug("No reply to the authorisation ping, logging in again")
+			self._authorisation_open.clear()
+			return True
+
+		return False
+
+	def _authorisation_opened(self) -> None:
+		now = time.monotonic()
+		self._last_login_at = now
+		self._last_authorisation_ping_at = now
+		# The login counts as the reply the next pings are measured against.
+		self._last_authorisation_ping_reply_at = now
+		self._last_device_state_packets_enabled_at = now
+		self._authorisation_open.set()
+
+	def _authorisation_ping_replied(self) -> None:
+		self._last_authorisation_ping_reply_at = time.monotonic()
+		self._authorisation_ping_replies_seen = True
+
+	def _send_authorisation_ping_if_due(self) -> bool:
+		"""Keep the authorised channel open without logging in again."""
+		if not self._authorisation_open.is_set():
+			return False
+
+		now = time.monotonic()
+		ping_due = now - self._last_authorisation_ping_at >= AUTHORISATION_PING_INTERVAL
+		device_states_due = now - self._last_device_state_packets_enabled_at >= DEVICE_STATE_PACKETS_REFRESH_INTERVAL
+
+		if not ping_due and not device_states_due:
+			return False
+
+		packets = []
+		if ping_due:
+			packets.append(self.create_packet_ui_control(UI_CONTROL_AUTHORISATION_PING))
+		if device_states_due:
+			packets.append(self.create_packet_enable_device_states())
+
+		if not self._authorisation_lock.acquire(blocking=False):
+			return False
+		try:
+			if self._stream_stop_event.is_set():
+				return False
+			self._send_packets(packets)
+		finally:
+			self._authorisation_lock.release()
+
+		if ping_due:
+			self._last_authorisation_ping_at = now
+		if device_states_due:
+			self._last_device_state_packets_enabled_at = now
+
+		return True
 
 	def _send_keepalive(self) -> bool:
 		if not self._authorisation_lock.acquire(blocking=False):
@@ -1386,6 +1485,7 @@ class Jablotron:
 				packets.insert(0, self.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END))
 			self._send_packets(packets)
 			self._authorisation_restore_pending = False
+			self._authorisation_opened()
 			return True
 		finally:
 			self._authorisation_lock.release()
@@ -2604,6 +2704,14 @@ class Jablotron:
 	@staticmethod
 	def _is_get_sections_and_pg_outputs_states_packet(packet: bytes) -> bool:
 		return packet[:1] == PACKET_COMMAND and packet[2:3] == COMMAND_GET_SECTIONS_AND_PG_OUTPUTS_STATES
+
+	@staticmethod
+	def _is_authorisation_ping_packet(packet: bytes) -> bool:
+		return packet[:1] == PACKET_UI_CONTROL and packet[2:3] == UI_CONTROL_AUTHORISATION_PING
+
+	@staticmethod
+	def _is_authorisation_end_packet(packet: bytes) -> bool:
+		return packet[:1] == PACKET_UI_CONTROL and packet[2:3] == UI_CONTROL_AUTHORISATION_END
 
 	@staticmethod
 	def _is_login_error_packet(packet: bytes) -> bool:
